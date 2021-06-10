@@ -72,6 +72,7 @@ impl<'r, R: Read> RegistryReader<'r, R> {
     }
 }
 
+#[derive(Debug)]
 pub struct SignatureIterator<'r, R, const B: usize> {
     reader: Option<&'r mut R>,
     offset: u32,

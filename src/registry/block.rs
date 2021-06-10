@@ -1,5 +1,5 @@
 use std::{
-    fmt::Debug,
+    fmt::{self, Binary, Debug, Formatter},
     io::{Cursor, Write},
     ops::{BitAnd, ShrAssign},
 };
@@ -23,17 +23,18 @@ use super::SIG_HEADER_MESSAGES;
 pub struct Block<const B: usize>;
 
 pub trait BlockRepr {
-    type Repr: Clone + Copy + Debug;
-    type Bytes: AsRef<[u8]> + AsMut<[u8]> + Default;
-    type Iter: Iterator<Item = u32>;
+    type Repr: Binary + Clone + Copy + Debug;
+    type Bytes: AsRef<[u8]> + AsMut<[u8]> + Default + Debug;
+    type Iter: Iterator<Item = u32> + Debug;
     type Compute: BlockCompute;
 
     fn to_be_bytes(repr: &Self::Repr) -> Self::Bytes;
     fn from_be_bytes(bytes: Self::Bytes) -> Self::Repr;
     fn read_le_bytes(bs: &[u8]) -> (Self::Repr, usize);
     fn count_non_revoked(repr: Self::Repr) -> usize;
-    fn block_iter(repr: Self::Repr, offset: u32) -> Self::Iter;
+    fn block_iter(repr: Self::Repr, offset: u32, pad: bool) -> Self::Iter;
     fn check_index(repr: Self::Repr, pos: u32) -> bool;
+    fn build(f: impl FnMut() -> Option<bool>) -> Option<Self::Repr>;
 }
 
 impl BlockRepr for Block<8> {
@@ -66,13 +67,39 @@ impl BlockRepr for Block<8> {
         repr.count_zeros() as usize
     }
 
-    fn block_iter(repr: Self::Repr, offset: u32) -> Self::Iter {
-        OffsetIter::new(repr, offset, 8)
+    fn block_iter(repr: Self::Repr, offset: u32, pad: bool) -> Self::Iter {
+        OffsetIter::new(repr, offset, 8, pad)
     }
 
     #[inline]
     fn check_index(repr: Self::Repr, pos: u32) -> bool {
         (repr >> pos) & 1 == 0
+    }
+
+    #[inline]
+    fn build(mut f: impl FnMut() -> Option<bool>) -> Option<Self::Repr> {
+        const TOP: u8 = 1 << 7;
+        let mut repr = 0u8;
+        let mut done = false;
+        for _ in 0..8 {
+            let rev = if done {
+                true
+            } else if let Some(rev) = f() {
+                rev
+            } else {
+                done = true;
+                true
+            };
+            repr >>= 1;
+            if rev {
+                repr |= TOP;
+            }
+        }
+        if repr != u8::MAX {
+            Some(repr)
+        } else {
+            None
+        }
     }
 }
 
@@ -105,14 +132,39 @@ impl BlockRepr for Block<64> {
         repr.count_zeros() as usize
     }
 
-    fn block_iter(repr: Self::Repr, offset: u32) -> Self::Iter {
-        OffsetIter::new(repr, offset, 64)
+    fn block_iter(repr: Self::Repr, offset: u32, pad: bool) -> Self::Iter {
+        OffsetIter::new(repr, offset, 64, pad)
     }
 
     #[inline]
     fn check_index(repr: Self::Repr, pos: u32) -> bool {
-        println!("{:b} {}", repr, pos);
         (repr >> pos) & 1 == 0
+    }
+
+    #[inline]
+    fn build(mut f: impl FnMut() -> Option<bool>) -> Option<Self::Repr> {
+        const TOP: u64 = 1 << 63;
+        let mut repr = 0u64;
+        let mut done = false;
+        for _ in 0..64 {
+            let rev = if done {
+                true
+            } else if let Some(rev) = f() {
+                rev
+            } else {
+                done = true;
+                true
+            };
+            repr >>= 1;
+            if rev {
+                repr |= TOP;
+            }
+        }
+        if repr != u64::MAX {
+            Some(repr)
+        } else {
+            None
+        }
     }
 }
 
@@ -123,17 +175,19 @@ pub struct OffsetIter<R> {
     last: u32,
     end: u32,
     remain: usize,
+    pad: bool,
 }
 
 impl<R> OffsetIter<R> {
     #[inline]
-    pub fn new(repr: R, offset: u32, remain: usize) -> Self {
+    pub fn new(repr: R, offset: u32, remain: usize, pad: bool) -> Self {
         Self {
             repr,
             offset,
             last: offset,
             end: offset + (remain as u32),
             remain,
+            pad,
         }
     }
 }
@@ -159,7 +213,7 @@ where
                 return Some(offs);
             }
         }
-        if self.remain > 0 {
+        if self.remain > 0 && self.pad {
             self.remain -= 1;
             Some(self.last)
         } else {
@@ -257,7 +311,7 @@ impl<const MC: usize, const FC: usize> BlockCompute for ComputeBlock<MC, FC> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SignatureEntry<const B: usize>
 where
     Block<B>: BlockRepr,
@@ -280,8 +334,12 @@ where
         }
     }
 
-    pub fn indices(&self) -> impl Iterator<Item = u32> {
-        Block::<B>::block_iter(self.nonrev, self.offset)
+    pub fn indices(&self) -> <Block<B> as BlockRepr>::Iter {
+        Block::<B>::block_iter(self.nonrev, self.offset, true)
+    }
+
+    pub fn unique_indices(&self) -> <Block<B> as BlockRepr>::Iter {
+        Block::<B>::block_iter(self.nonrev, self.offset, false)
     }
 
     pub fn public_key(&self, dpk: &DeterministicPublicKey) -> PublicKey {
@@ -306,14 +364,38 @@ where
     }
 }
 
+impl<const B: usize> Debug for SignatureEntry<B>
+where
+    Block<B>: BlockRepr,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SignatureEntry")
+            .field("nonrev", &format_args!("{:b}", self.nonrev))
+            .field("offset", &self.offset)
+            .field("level", &self.level)
+            .field("sig", &"<sig>")
+            .finish()
+    }
+}
+
 #[test]
 fn test_offset_iter() {
     let iter = OffsetIter::<u8>::new(
         !11u8, // 11110100
-        10, 8,
+        10, 8, true,
     );
     assert_eq!(
         iter.collect::<Vec<u32>>(),
         vec![10u32, 11u32, 13u32, 13u32, 13u32, 13u32, 13u32, 13u32]
     );
+}
+
+#[test]
+fn test_build_block() {
+    let mut idx = 0;
+    let repr = Block::<64>::build(|| {
+        idx += 1;
+        Some(idx == 3 || idx == 5)
+    });
+    assert_eq!(repr, Some((1u64 << 2) + (1 << 4)));
 }

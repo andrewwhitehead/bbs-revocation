@@ -71,7 +71,7 @@ impl<'b, const B: usize> RegistryBuilder<'b, B> {
         &self,
         writer: &mut impl SeekWrite,
         revoked: impl IntoIterator<Item = u32>,
-    ) -> Result<(), IoError>
+    ) -> Result<usize, IoError>
     where
         Block<B>: BlockRepr,
     {
@@ -102,7 +102,7 @@ impl<'w, W: SeekWrite, const B: usize> RegistryWriter<'w, W, B> {
     pub fn write_signatures(
         &mut self,
         entries: impl IntoIterator<Item = SignatureEntry<B>>,
-    ) -> Result<(), IoError>
+    ) -> Result<usize, IoError>
     where
         Block<B>: BlockRepr,
     {
@@ -117,6 +117,7 @@ impl<'w, W: SeekWrite, const B: usize> RegistryWriter<'w, W, B> {
             writer.write_all(&c.to_be_bytes()[..])?;
             Result::<_, IoError>::Ok(())
         };
+        let mut count = 0;
         for entry in entries.into_iter() {
             if span == 0 || entry.offset != offset + 1 {
                 span = 0;
@@ -135,6 +136,7 @@ impl<'w, W: SeekWrite, const B: usize> RegistryWriter<'w, W, B> {
             writer.write_all(Block::<B>::to_be_bytes(&entry.nonrev).as_ref())?;
             writer.write_all(&entry.sig[..])?;
             span += 1;
+            count += 1;
         }
         if span > 1 {
             update_count(writer, entry_start, span)?;
@@ -143,7 +145,7 @@ impl<'w, W: SeekWrite, const B: usize> RegistryWriter<'w, W, B> {
         writer.seek(SeekFrom::Start(start))?;
         writer.write_all(&len.to_be_bytes()[..])?;
         writer.seek(SeekFrom::End(0))?;
-        Ok(())
+        Ok(count)
     }
 }
 
@@ -186,7 +188,7 @@ where
         Self {
             buffer,
             offset: 0,
-            level: 0,
+            level: 1,
             pk,
             sk,
             e,
@@ -205,13 +207,48 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if self.level == 1 {
-                return None;
+                let offset = (self.offset * 8 / B) as u32;
+                if let Some(nonrev) = Block::<B>::build(|| {
+                    if self.offset < self.buffer.len() {
+                        let (nonrev, len) = Block::<B>::read_le_bytes(&self.buffer[self.offset..]);
+                        self.offset += len;
+                        if Block::<B>::count_non_revoked(nonrev) == B {
+                            // subtract block
+                            for idx in (self.offset - len)..self.offset {
+                                self.buffer[idx] = u8::MAX;
+                            }
+                            Some(false)
+                        } else {
+                            Some(true)
+                        }
+                    } else {
+                        self.level = 0;
+                        self.offset = 0;
+                        None
+                    }
+                }) {
+                    let indices = Block::<B>::block_iter(nonrev, offset, true);
+                    let b = <Block<B> as BlockRepr>::Compute::compute_b(
+                        self.header_messages,
+                        indices,
+                        self.level,
+                        &self.pk,
+                        self.s,
+                    );
+                    let sig = sign_b(&self.sk, self.e, b);
+                    return Some(SignatureEntry {
+                        nonrev,
+                        offset,
+                        level: 1,
+                        sig,
+                    });
+                }
             } else if self.offset < self.buffer.len() {
                 let (nonrev, len) = Block::<B>::read_le_bytes(&self.buffer[self.offset..]);
                 let offset = (self.offset * 8) as u32;
                 self.offset += len;
                 if Block::<B>::count_non_revoked(nonrev) > 0 {
-                    let indices = Block::<B>::block_iter(nonrev, offset);
+                    let indices = Block::<B>::block_iter(nonrev, offset, true);
                     let b = <Block<B> as BlockRepr>::Compute::compute_b(
                         self.header_messages,
                         indices,
