@@ -305,7 +305,7 @@ impl<const MC: usize, const FC: usize> BlockCompute for ComputeBlock<MC, FC> {
         let mut msgs = heapless::Vec::<_, MC>::new();
         msgs.extend(head.iter().copied());
         for idx in indices {
-            msgs.push(compute_index(idx, level)).unwrap();
+            msgs.push(compute_index_message(idx, level)).unwrap();
         }
         f(msgs.as_slice())
     }

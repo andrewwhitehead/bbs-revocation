@@ -72,7 +72,7 @@ pub fn hash_to_fr(data: &[u8]) -> Fr {
 }
 
 #[inline]
-pub fn compute_index(index: u32, level: u16) -> SignatureMessage {
+pub fn compute_index_message(index: u32, level: u16) -> SignatureMessage {
     // let mut data = [0u8; 8];
     // data[..4].copy_from_slice(&(height as u32).to_be_bytes()[..]);
     // data[4..].copy_from_slice(&index.to_be_bytes()[..]);

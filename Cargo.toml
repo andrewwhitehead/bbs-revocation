@@ -1,13 +1,17 @@
+[workspace]
+members = ["bbs_revocation"]
+
 [package]
-name = "bbs-revocation"
+name = "bbs-revocation-demo"
 version = "0.1.0"
 authors = ["Andrew Whitehead <cywolf@gmail.com>"]
 edition = "2018"
 
 [dependencies]
 bbs = "0.4"
-blake2 = "0.8"
-ff-zeroize = "0.6"
-heapless = "0.7"
-pairing-plus = "0.19"
+bbs-revocation = { path = "./bbs_revocation" }
 rand = "0.7"
+
+[profile.release]
+lto = true
+codegen-units = 1

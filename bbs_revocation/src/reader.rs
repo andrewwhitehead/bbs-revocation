@@ -1,11 +1,12 @@
 use std::io::{Error as IoError, Read};
 
-use bbs::{keys::PublicKey, signature::Signature, G1_COMPRESSED_SIZE};
+use bbs::{keys::PublicKey, signature::Signature, SignatureMessage, G1_COMPRESSED_SIZE};
 use pairing_plus::bls12_381::Fr;
 
 use super::block::{Block, BlockCompute, BlockRepr, SignatureEntry};
 use super::header::RegistryHeader;
 use super::util::*;
+use super::SIG_HEADER_MESSAGES;
 
 pub struct RegistryReader<'r, R> {
     pub header: RegistryHeader<'r>,
@@ -43,6 +44,10 @@ impl<'r, R: Read> RegistryReader<'r, R> {
         } else {
             None
         }
+    }
+
+    pub fn signature_messages(&self) -> [SignatureMessage; SIG_HEADER_MESSAGES] {
+        self.header.signature_messages()
     }
 
     pub fn find_signature(

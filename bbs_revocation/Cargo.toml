@@ -1,0 +1,22 @@
+[package]
+name = "bbs-revocation"
+version = "0.1.0"
+authors = ["Andrew Whitehead <cywolf@gmail.com>"]
+edition = "2018"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/andrewwhitehead/bbs-revocation/"
+categories = []
+keywords = ["bbs", "verifiable", "credentials", "revocation"]
+
+[lib]
+name = "bbs_revocation"
+path = "src/lib.rs"
+crate-type = ["staticlib", "rlib", "cdylib"]
+
+[dependencies]
+bbs = "0.4"
+blake2 = "0.8"
+ff-zeroize = "0.6"
+heapless = "0.7"
+pairing-plus = "0.19"
+rand = "0.7"

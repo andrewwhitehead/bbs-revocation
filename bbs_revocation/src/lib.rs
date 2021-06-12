@@ -16,6 +16,7 @@ mod reader;
 pub use self::reader::RegistryReader;
 
 mod util;
+pub use self::util::compute_index_message;
 
 pub const SIG_HEADER_MESSAGES: usize = 4;
 
