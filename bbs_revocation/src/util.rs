@@ -31,14 +31,14 @@ pub fn sign_b(sk: &SecretKey, e: Fr, mut b: G1) -> [u8; G1_COMPRESSED_SIZE] {
 }
 
 #[inline]
-pub fn read_fixed<const B: usize>(reader: &mut impl Read) -> Result<[u8; B], IoError> {
+pub fn read_fixed<const B: usize>(mut reader: impl Read) -> Result<[u8; B], IoError> {
     let mut buf = [0u8; B];
     reader.read_exact(&mut buf[..])?;
     Ok(buf)
 }
 
-pub fn read_str(reader: &mut impl Read) -> Result<String, IoError> {
-    let len: [u8; 4] = read_fixed(reader)?;
+pub fn read_str(mut reader: impl Read) -> Result<String, IoError> {
+    let len: [u8; 4] = read_fixed(&mut reader)?;
     let len = u32::from_be_bytes(len);
     let mut s = vec![0u8; len as usize];
     reader.read_exact(&mut s[..])?;

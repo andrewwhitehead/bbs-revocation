@@ -1,109 +1,179 @@
-use std::io::{Error as IoError, Read};
+use std::io::{Error as IoError, Read, Seek, SeekFrom};
 
-use bbs::{keys::PublicKey, signature::Signature, SignatureMessage, G1_COMPRESSED_SIZE};
+use bbs::prelude::PublicKey;
+use bbs::{signature::Signature, G1_COMPRESSED_SIZE};
 use pairing_plus::bls12_381::Fr;
 
-use super::block::{Block, BlockCompute, BlockRepr, SignatureEntry};
+use super::block::{Block, SignatureEntry};
 use super::header::RegistryHeader;
 use super::util::*;
-use super::SIG_HEADER_MESSAGES;
 
 pub struct RegistryReader<'r, R> {
-    pub header: RegistryHeader<'r>,
-    pub reader: &'r mut R,
+    header: RegistryHeader<'r>,
+    reader: TakeReset<R>,
+}
+
+impl<R: Read> RegistryReader<'static, R> {
+    pub fn new(mut reader: R) -> Result<Self, IoError> {
+        let (header, _) = RegistryHeader::read(&mut reader)?;
+        let entries_len = u64::from_be_bytes(read_fixed(&mut reader)?);
+        if header.levels != 2 {}
+        Ok(Self {
+            header,
+            reader: TakeReset::new(reader, entries_len),
+        })
+    }
 }
 
 impl<'r, R: Read> RegistryReader<'r, R> {
-    pub fn new(reader: &'r mut R) -> Result<Self, IoError> {
-        let header = RegistryHeader::read(reader)?;
-        Ok(Self { header, reader })
-    }
-
     pub fn header(&self) -> &RegistryHeader<'r> {
         &self.header
     }
 
-    pub fn entries<const B: usize>(self) -> Result<SignatureIterator<'r, R, B>, IoError>
+    #[inline]
+    pub fn public_key(&self) -> PublicKey {
+        self.header.public_key()
+    }
+
+    pub fn entry_count(self) -> Result<u32, IoError> {
+        SignatureIterator::new(self.reader, self.header.block_size, self.header.levels)
+            .entry_count()
+    }
+
+    pub fn entry_count_reset(&mut self) -> Result<u32, IoError>
     where
-        Block<B>: BlockRepr,
+        R: Seek,
     {
-        let len: [u8; 8] = read_fixed(&mut *self.reader)?;
-        let len = u64::from_be_bytes(len);
-        Ok(SignatureIterator::new(self.reader, len))
-    }
-
-    pub fn public_key(&self) -> Option<PublicKey> {
-        if self.header.block_size == 8 {
-            Some(<Block<8> as BlockRepr>::Compute::public_key(
-                &self.header.dpk,
-            ))
-        } else if self.header.block_size == 64 {
-            Some(<Block<64> as BlockRepr>::Compute::public_key(
-                &self.header.dpk,
-            ))
-        } else {
-            None
-        }
-    }
-
-    pub fn signature_messages(&self) -> [SignatureMessage; SIG_HEADER_MESSAGES] {
-        self.header.signature_messages()
+        let result =
+            SignatureIterator::new(&mut self.reader, self.header.block_size, self.header.levels)
+                .entry_count()?;
+        self.reader.reset()?;
+        Ok(result)
     }
 
     pub fn find_signature(
         self,
         slot_index: u32,
     ) -> Result<Option<(Vec<u32>, u16, Signature)>, IoError> {
-        if self.header.levels != 2 {
-            return Ok(None);
+        SignatureIterator::new(self.reader, self.header.block_size, self.header.levels)
+            .find_signature(slot_index, self.header.e, self.header.s)
+    }
+
+    pub fn find_signature_reset(
+        &mut self,
+        slot_index: u32,
+    ) -> Result<Option<(Vec<u32>, u16, Signature)>, IoError>
+    where
+        R: Seek,
+    {
+        let result =
+            SignatureIterator::new(&mut self.reader, self.header.block_size, self.header.levels)
+                .find_signature(slot_index, self.header.e, self.header.s)?;
+        self.reader.reset()?;
+        Ok(result)
+    }
+}
+
+impl<'r, R: Read> IntoIterator for RegistryReader<'r, R> {
+    type Item = Result<SignatureEntry, IoError>;
+    type IntoIter = SignatureIterator<TakeReset<R>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        SignatureIterator::new(self.reader, self.header.block_size, self.header.levels)
+    }
+}
+
+pub struct TakeReset<R> {
+    inner: R,
+    pos: u64,
+    limit: u64,
+}
+
+impl<R: Read> TakeReset<R> {
+    pub fn new(reader: R, limit: u64) -> Self {
+        Self {
+            inner: reader,
+            pos: 0,
+            limit,
         }
-        let len: [u8; 8] = read_fixed(&mut *self.reader)?;
-        let len = u64::from_be_bytes(len);
-        if self.header.block_size == 8 {
-            SignatureIterator::<R, 8>::new(self.reader, len).find_signature(
-                slot_index,
-                self.header.e,
-                self.header.s,
-            )
-        } else if self.header.block_size == 64 {
-            SignatureIterator::<R, 64>::new(self.reader, len).find_signature(
-                slot_index,
-                self.header.e,
-                self.header.s,
-            )
-        } else {
-            Ok(None)
+    }
+}
+
+impl<R: Read> Read for TakeReset<R> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
+        let max = buf.len().min((self.limit - self.pos) as usize);
+        let len = self.inner.read(&mut buf[..max])?;
+        self.pos += len as u64;
+        Ok(len)
+    }
+}
+
+impl<R: Seek> TakeReset<R> {
+    fn reset(&mut self) -> Result<(), IoError> {
+        if self.pos != 0 {
+            self.inner.seek(SeekFrom::Current(-(self.pos as i64)))?;
+            self.pos = 0;
         }
+        Ok(())
+    }
+}
+
+pub trait DoneRead: Read {
+    fn is_done(&self) -> bool;
+}
+
+impl<R: Read> DoneRead for TakeReset<R> {
+    fn is_done(&self) -> bool {
+        self.pos == self.limit
+    }
+}
+
+impl<'r, R: DoneRead> DoneRead for &'r mut R {
+    fn is_done(&self) -> bool {
+        (&**self).is_done()
     }
 }
 
 #[derive(Debug)]
-pub struct SignatureIterator<'r, R, const B: usize> {
-    reader: Option<&'r mut R>,
-    offset: u32,
-    level: u16,
-    count: u16,
-    len: u64,
+pub struct SignatureIterator<R: DoneRead> {
+    reader: Option<R>,
+    active_offset: u32,
+    active_level: u16,
+    active_count: u16,
+    block_size: u16,
 }
 
-impl<'r, R, const B: usize> SignatureIterator<'r, R, B>
-where
-    Block<B>: BlockRepr,
-    R: Read,
-{
+impl<R: DoneRead> SignatureIterator<R> {
     #[inline]
-    pub fn new(reader: &'r mut R, len: u64) -> Self {
+    pub(crate) fn new(reader: R, block_size: u16, levels: u16) -> Self {
+        let reader = if levels == 2 && block_size <= 64 && block_size > 0 && block_size % 8 == 0 {
+            Some(reader)
+        } else {
+            // not supported
+            None
+        };
         Self {
-            reader: Some(reader),
-            offset: 0,
-            level: 0,
-            count: 0,
-            len,
+            reader,
+            active_offset: 0,
+            active_level: 0,
+            active_count: 0,
+            block_size,
         }
     }
+}
 
-    pub fn find_signature(
-        self,
+impl<R: DoneRead> SignatureIterator<R> {
+    pub fn entry_count(&mut self) -> Result<u32, IoError> {
+        let mut count = 0;
+        for entry in self {
+            entry?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    pub(crate) fn find_signature(
+        &mut self,
         slot_index: u32,
         e: Fr,
         s: Fr,
@@ -117,8 +187,11 @@ where
         }
     }
 
-    pub fn find_entry(self, slot_index: u32) -> Result<Option<SignatureEntry<B>>, IoError> {
-        let block_index = slot_index / (B as u32);
+    pub(crate) fn find_entry(
+        &mut self,
+        slot_index: u32,
+    ) -> Result<Option<SignatureEntry>, IoError> {
+        let block_index = slot_index / (self.block_size as u32);
         for entry in self {
             let entry = entry?;
             if entry.level == 0 {
@@ -135,48 +208,38 @@ where
     }
 
     #[inline]
-    fn read_next(&mut self, reader: &mut R) -> Result<SignatureEntry<B>, IoError> {
-        if self.count == 0 {
-            let offs: [u8; 4] = read_fixed(reader)?;
-            self.offset = u32::from_be_bytes(offs);
-            let level: [u8; 2] = read_fixed(reader)?;
-            self.level = u16::from_be_bytes(level);
-            let count: [u8; 2] = read_fixed(reader)?;
-            self.count = u16::from_be_bytes(count);
-            self.len -= 8;
+    fn read_next(&mut self, reader: &mut R) -> Result<SignatureEntry, IoError> {
+        if self.active_count == 0 {
+            let offs: [u8; 4] = read_fixed(&mut *reader)?;
+            self.active_offset = u32::from_be_bytes(offs);
+            let level: [u8; 2] = read_fixed(&mut *reader)?;
+            self.active_level = u16::from_be_bytes(level);
+            let count: [u8; 2] = read_fixed(&mut *reader)?;
+            self.active_count = u16::from_be_bytes(count);
         }
-        let mut nonrev = <Block<B> as BlockRepr>::Bytes::default();
-        reader.read_exact(nonrev.as_mut())?;
-        self.len -= nonrev.as_ref().len() as u64;
+        let nonrev = Block::read(&mut *reader, self.block_size)?;
         let mut sig = [0u8; G1_COMPRESSED_SIZE];
         reader.read_exact(sig.as_mut())?;
-        self.len -= G1_COMPRESSED_SIZE as u64;
         let entry = SignatureEntry {
-            nonrev: Block::<B>::from_be_bytes(nonrev),
-            offset: self.offset,
-            level: self.level,
+            nonrev,
+            start: self.active_offset,
+            count: self.block_size,
+            level: self.active_level,
             sig,
         };
-        self.count -= 1;
-        self.offset += 1;
+        self.active_count -= 1;
+        self.active_offset += 1;
         Ok(entry)
     }
 }
 
-impl<'r, R, const B: usize> Iterator for SignatureIterator<'r, R, B>
-where
-    Block<B>: BlockRepr,
-    R: Read,
-{
-    type Item = Result<SignatureEntry<B>, IoError>;
+impl<R: DoneRead> Iterator for SignatureIterator<R> {
+    type Item = Result<SignatureEntry, IoError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(reader) = self.reader.take() {
-            if self.len == 0 {
-                return None;
-            }
-            let result = self.read_next(reader);
-            if result.is_ok() {
+        if let Some(mut reader) = self.reader.take() {
+            let result = self.read_next(&mut reader);
+            if result.is_ok() && !reader.is_done() {
                 self.reader.replace(reader);
             }
             Some(result)
@@ -184,4 +247,21 @@ where
             None
         }
     }
+}
+
+#[test]
+fn test_take_reset() {
+    use std::io::Cursor;
+
+    let buf = [0u8, 1u8, 2u8, 3u8];
+    let mut tr = TakeReset::new(Cursor::new(&buf[..]), 4);
+    let mut cp = [0u8; 4];
+    tr.read_exact(&mut cp[..]).unwrap();
+    assert_eq!(cp, buf);
+    assert!(tr.is_done());
+    tr.reset().unwrap();
+    assert!(!tr.is_done());
+    tr.read_exact(&mut cp[..]).unwrap();
+    assert_eq!(cp, buf);
+    assert!(tr.is_done());
 }

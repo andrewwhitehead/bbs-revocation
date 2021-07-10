@@ -1,11 +1,10 @@
 use std::{
-    fmt::{self, Binary, Debug, Formatter},
-    io::{Cursor, Write},
-    ops::{BitAnd, ShrAssign},
+    fmt::{self, Debug, Formatter},
+    io::{Cursor, Error as IoError, Read, Write},
 };
 
 use bbs::{
-    keys::{DeterministicPublicKey, PublicKey},
+    keys::{PublicKey, SecretKey},
     signature::{Signature, SIGNATURE_COMPRESSED_SIZE},
     SignatureMessage, G1_COMPRESSED_SIZE,
 };
@@ -19,247 +18,87 @@ use pairing_plus::{
 use super::util::*;
 use super::SIG_HEADER_MESSAGES;
 
-#[derive(Debug)]
-pub struct Block<const B: usize>;
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct Block(u64);
 
-pub trait BlockRepr {
-    type Repr: Binary + Clone + Copy + Debug;
-    type Bytes: AsRef<[u8]> + AsMut<[u8]> + Default + Debug;
-    type Iter: Iterator<Item = u32> + Debug;
-    type Compute: BlockCompute;
+impl Block {
+    const SIZE: usize = 8;
 
-    fn to_be_bytes(repr: &Self::Repr) -> Self::Bytes;
-    fn from_be_bytes(bytes: Self::Bytes) -> Self::Repr;
-    fn read_le_bytes(bs: &[u8]) -> (Self::Repr, usize);
-    fn count_non_revoked(repr: Self::Repr) -> usize;
-    fn block_iter(repr: Self::Repr, offset: u32, pad: bool) -> Self::Iter;
-    fn check_index(repr: Self::Repr, pos: u32) -> bool;
-    fn build(f: impl FnMut() -> Option<bool>) -> Option<Self::Repr>;
-}
-
-impl BlockRepr for Block<8> {
-    type Repr = u8;
-    type Bytes = [u8; 1];
-    type Iter = OffsetIter<u8>;
-    type Compute = ComputeBlock<12, 14>;
-
-    #[inline]
-    fn to_be_bytes(repr: &Self::Repr) -> Self::Bytes {
-        repr.to_be_bytes()
-    }
-
-    #[inline]
-    fn from_be_bytes(bytes: Self::Bytes) -> Self::Repr {
-        bytes[0]
-    }
-
-    #[inline]
-    fn read_le_bytes(bs: &[u8]) -> (Self::Repr, usize) {
-        if bs.len() > 0 {
-            (bs[0], 1)
-        } else {
-            (u8::MAX, 0)
+    pub(crate) const fn debug_print(&self, count: u16) -> BlockDebug {
+        BlockDebug {
+            nonrev: self.0,
+            count: count as usize,
         }
     }
 
-    #[inline]
-    fn count_non_revoked(repr: Self::Repr) -> usize {
-        repr.count_zeros() as usize
+    pub const fn is_revoked_at(&self, offset: u32) -> bool {
+        self.0 & (1 << offset) == 0
     }
 
-    fn block_iter(repr: Self::Repr, offset: u32, pad: bool) -> Self::Iter {
-        OffsetIter::new(repr, offset, 8, pad)
+    pub const fn is_revoked(&self) -> bool {
+        self.0 == 0
     }
 
-    #[inline]
-    fn check_index(repr: Self::Repr, pos: u32) -> bool {
-        (repr >> pos) & 1 == 0
-    }
-
-    #[inline]
-    fn build(mut f: impl FnMut() -> Option<bool>) -> Option<Self::Repr> {
-        const TOP: u8 = 1 << 7;
-        let mut repr = 0u8;
-        let mut done = false;
-        for _ in 0..8 {
-            let rev = if done {
-                true
-            } else if let Some(rev) = f() {
-                rev
-            } else {
-                done = true;
-                true
-            };
-            repr >>= 1;
-            if rev {
-                repr |= TOP;
-            }
-        }
-        if repr != u8::MAX {
-            Some(repr)
-        } else {
-            None
-        }
-    }
-}
-
-impl BlockRepr for Block<64> {
-    type Repr = u64;
-    type Bytes = [u8; 8];
-    type Iter = OffsetIter<u64>;
-    type Compute = ComputeBlock<68, 70>;
-
-    #[inline]
-    fn to_be_bytes(repr: &Self::Repr) -> Self::Bytes {
-        repr.to_be_bytes()
+    pub const fn count(&self) -> u16 {
+        self.0.count_ones() as u16
     }
 
     #[inline]
-    fn from_be_bytes(bytes: Self::Bytes) -> Self::Repr {
-        u64::from_be_bytes(bytes)
+    pub fn from_slice(buffer: &[u8]) -> Self {
+        let mut val = [0u8; Self::SIZE];
+        let len = buffer.len().min(Self::SIZE);
+        val[..len].copy_from_slice(&buffer[..len]);
+        Self(u64::from_le_bytes(val))
     }
 
     #[inline]
-    fn read_le_bytes(bs: &[u8]) -> (Self::Repr, usize) {
-        let mut buf = [u8::MAX; 8];
-        let len = bs.len().min(8);
-        buf[..len].copy_from_slice(&bs[..len]);
-        (u64::from_le_bytes(buf), len)
+    pub fn read<R: Read>(mut reader: R, block_size: u16) -> Result<Self, IoError> {
+        let mut val = [0u8; Self::SIZE];
+        let len = (block_size as usize / 8).min(Self::SIZE);
+        reader.read_exact(&mut val[..len])?;
+        Ok(Self(u64::from_le_bytes(val)))
     }
 
-    #[inline]
-    fn count_non_revoked(repr: Self::Repr) -> usize {
-        repr.count_zeros() as usize
-    }
-
-    fn block_iter(repr: Self::Repr, offset: u32, pad: bool) -> Self::Iter {
-        OffsetIter::new(repr, offset, 64, pad)
-    }
-
-    #[inline]
-    fn check_index(repr: Self::Repr, pos: u32) -> bool {
-        (repr >> pos) & 1 == 0
-    }
-
-    #[inline]
-    fn build(mut f: impl FnMut() -> Option<bool>) -> Option<Self::Repr> {
-        const TOP: u64 = 1 << 63;
+    pub fn build(count: usize, mut f: impl FnMut() -> Option<bool>) -> Option<Self> {
+        let mut count = count.min(64);
+        let mut flag = 1u64;
         let mut repr = 0u64;
-        let mut done = false;
-        for _ in 0..64 {
-            let rev = if done {
-                true
-            } else if let Some(rev) = f() {
-                rev
+        while count > 0 {
+            if let Some(nonrev) = f() {
+                if nonrev {
+                    repr |= flag;
+                }
+                flag <<= 1;
+                count -= 1;
             } else {
-                done = true;
-                true
-            };
-            repr >>= 1;
-            if rev {
-                repr |= TOP;
+                break;
             }
         }
-        if repr != u64::MAX {
-            Some(repr)
+        if repr != 0 {
+            Some(Self(repr))
         } else {
             None
         }
     }
-}
-
-#[derive(Debug)]
-pub struct OffsetIter<R> {
-    repr: R,
-    offset: u32,
-    last: u32,
-    end: u32,
-    remain: usize,
-    pad: bool,
-}
-
-impl<R> OffsetIter<R> {
-    #[inline]
-    pub fn new(repr: R, offset: u32, remain: usize, pad: bool) -> Self {
-        Self {
-            repr,
-            offset,
-            last: offset,
-            end: offset + (remain as u32),
-            remain,
-            pad,
-        }
-    }
-}
-
-impl<R> Iterator for OffsetIter<R>
-where
-    R: BitAnd<Output = R> + Copy + From<u8> + PartialEq + ShrAssign,
-{
-    type Item = u32;
 
     #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        let one = R::from(1u8);
-        let zero = R::from(0u8);
-        while self.offset < self.end {
-            let cmp = self.repr & one;
-            let offs = self.offset;
-            self.repr >>= one;
-            self.offset += 1;
-            if cmp == zero {
-                self.remain -= 1;
-                self.last = offs;
-                return Some(offs);
-            }
-        }
-        if self.remain > 0 && self.pad {
-            self.remain -= 1;
-            Some(self.last)
-        } else {
-            None
-        }
+    pub fn indices(&self, start: u32, count: usize, pad: bool) -> OffsetIter {
+        OffsetIter::new(self.0, start, count, pad)
     }
-}
 
-pub trait BlockCompute {
-    fn compute_b<I>(
+    pub fn compute_b(
+        &self,
         head: [SignatureMessage; SIG_HEADER_MESSAGES],
-        indices: I,
+        start: u32,
+        count: u16,
         level: u16,
         pk: &PublicKey,
         s: Fr,
-    ) -> G1
-    where
-        I: IntoIterator<Item = u32>;
-
-    fn public_key(dpk: &DeterministicPublicKey) -> PublicKey;
-
-    fn with_messages<I, F, R>(
-        head: [SignatureMessage; SIG_HEADER_MESSAGES],
-        indices: I,
-        level: u16,
-        f: F,
-    ) -> R
-    where
-        I: IntoIterator<Item = u32>,
-        F: FnOnce(&[SignatureMessage]) -> R;
-}
-
-pub struct ComputeBlock<const MC: usize, const FC: usize>;
-
-impl<const MC: usize, const FC: usize> BlockCompute for ComputeBlock<MC, FC> {
-    fn compute_b<I>(
-        head: [SignatureMessage; SIG_HEADER_MESSAGES],
-        indices: I,
-        level: u16,
-        pk: &PublicKey,
-        s: Fr,
-    ) -> G1
-    where
-        I: IntoIterator<Item = u32>,
-    {
-        // 2 + 66 messages
+    ) -> G1 {
+        assert!(count <= 64);
+        const FC: usize = 2 + SIG_HEADER_MESSAGES + 64;
+        // up to 2 + 66 messages
         let mut bases = heapless::Vec::<_, FC>::new();
         let mut scalars = heapless::Vec::<[u64; 4], FC>::new();
 
@@ -278,7 +117,7 @@ impl<const MC: usize, const FC: usize> BlockCompute for ComputeBlock<MC, FC> {
         for msg in head.iter() {
             scalars.push(fr_mul_repr(msg.as_ref().into_repr())).unwrap();
         }
-        for index in indices {
+        for index in self.indices(start, count as usize, true) {
             scalars
                 .push(fr_mul_repr(compute_index_repr(index, level)))
                 .unwrap();
@@ -288,62 +127,137 @@ impl<const MC: usize, const FC: usize> BlockCompute for ComputeBlock<MC, FC> {
         G1Affine::sum_of_products(&bases[..], &s[..])
     }
 
-    fn public_key(dpk: &DeterministicPublicKey) -> PublicKey {
-        dpk.to_public_key(MC).unwrap()
-    }
-
-    fn with_messages<I, F, R>(
-        head: [SignatureMessage; SIG_HEADER_MESSAGES],
-        indices: I,
-        level: u16,
-        f: F,
-    ) -> R
-    where
-        I: IntoIterator<Item = u32>,
-        F: FnOnce(&[SignatureMessage]) -> R,
-    {
-        let mut msgs = heapless::Vec::<_, MC>::new();
-        msgs.extend(head.iter().copied());
-        for idx in indices {
-            msgs.push(compute_index_message(idx, level)).unwrap();
-        }
-        f(msgs.as_slice())
+    #[inline]
+    pub fn to_le_bytes(&self) -> [u8; Self::SIZE] {
+        self.0.to_le_bytes()
     }
 }
 
-#[derive(Clone)]
-pub struct SignatureEntry<const B: usize>
-where
-    Block<B>: BlockRepr,
-{
-    pub nonrev: <Block<B> as BlockRepr>::Repr,
-    pub offset: u32,
+impl Debug for Block {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!("Block({:?})", self.debug_print(64)))
+    }
+}
+
+impl From<u64> for Block {
+    fn from(val: u64) -> Self {
+        Block(val)
+    }
+}
+
+pub(crate) struct BlockDebug {
+    nonrev: u64,
+    count: usize,
+}
+
+impl Debug for BlockDebug {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let mut n = self.nonrev;
+        for _ in 0..self.count {
+            f.write_str(if n & 1 == 0 { "0" } else { "1" })?;
+            n >>= 1;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct OffsetIter {
+    nonrev: u64,
+    offset: u32,
+    last: u32,
+    end: u32,
+    remain: usize,
+    pad: bool,
+}
+
+impl OffsetIter {
+    #[inline]
+    pub fn new(nonrev: u64, offset: u32, remain: usize, pad: bool) -> Self {
+        Self {
+            nonrev,
+            offset,
+            last: offset,
+            end: offset + (remain as u32),
+            remain,
+            pad,
+        }
+    }
+}
+
+impl Iterator for OffsetIter {
+    type Item = u32;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.offset < self.end {
+            let cmp = self.nonrev & 1;
+            let offs = self.offset;
+            self.nonrev >>= 1;
+            self.offset += 1;
+            if cmp == 1 {
+                self.remain -= 1;
+                self.last = offs;
+                return Some(offs);
+            }
+        }
+        if self.remain > 0 && self.pad {
+            self.remain -= 1;
+            Some(self.last)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct SignatureEntry {
+    pub nonrev: Block,
+    pub start: u32,
     pub level: u16,
+    pub count: u16,
     pub sig: [u8; G1_COMPRESSED_SIZE],
 }
 
-impl<const B: usize> SignatureEntry<B>
-where
-    Block<B>: BlockRepr,
-{
+impl SignatureEntry {
+    pub(crate) fn create(
+        nonrev: Block,
+        head: [SignatureMessage; SIG_HEADER_MESSAGES],
+        start: u32,
+        count: u16,
+        level: u16,
+        pk: &PublicKey,
+        sk: &SecretKey,
+        e: Fr,
+        s: Fr,
+    ) -> SignatureEntry {
+        let b = nonrev.compute_b(head, start, count, level, pk, s);
+        let sig = sign_b(sk, e, b);
+        SignatureEntry {
+            nonrev,
+            start,
+            count,
+            level,
+            sig,
+        }
+    }
+
     pub fn contains_index(&self, index: u32) -> Option<bool> {
-        if self.offset <= index && self.offset + (B as u32) > index {
-            Some(Block::<B>::check_index(self.nonrev, index - self.offset))
+        if self.start <= index && self.start + (self.count as u32) > index {
+            Some(!self.nonrev.is_revoked_at(index - self.start))
         } else {
             None
         }
     }
 
-    pub fn indices(&self) -> <Block<B> as BlockRepr>::Iter {
-        Block::<B>::block_iter(self.nonrev, self.offset, true)
+    #[inline]
+    pub fn indices(&self) -> OffsetIter {
+        self.nonrev.indices(self.start, self.count as usize, true)
     }
 
-    pub fn unique_indices(&self) -> <Block<B> as BlockRepr>::Iter {
-        Block::<B>::block_iter(self.nonrev, self.offset, false)
-    }
-
-    pub fn public_key(&self, dpk: &DeterministicPublicKey) -> PublicKey {
-        <Block<B> as BlockRepr>::Compute::public_key(dpk)
+    #[inline]
+    pub fn unique_indices(&self) -> OffsetIter {
+        self.nonrev.indices(self.start, self.count as usize, false)
     }
 
     pub fn signature(&self, e: Fr, s: Fr) -> Signature {
@@ -360,19 +274,24 @@ where
         head: [SignatureMessage; SIG_HEADER_MESSAGES],
         f: impl FnOnce(&[SignatureMessage]) -> R,
     ) -> R {
-        <Block<B> as BlockRepr>::Compute::with_messages(head, self.indices(), self.level, f)
+        const FC: usize = 2 + SIG_HEADER_MESSAGES + 64;
+        let mut msgs = heapless::Vec::<SignatureMessage, FC>::new();
+        msgs.extend(head.iter().copied());
+        msgs.extend(
+            self.indices()
+                .map(|index| compute_index_message(index, self.level)),
+        );
+        f(&msgs[..])
     }
 }
 
-impl<const B: usize> Debug for SignatureEntry<B>
-where
-    Block<B>: BlockRepr,
-{
+impl Debug for SignatureEntry {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("SignatureEntry")
-            .field("nonrev", &format_args!("{:b}", self.nonrev))
-            .field("offset", &self.offset)
+            .field("nonrev", &self.nonrev.debug_print(self.count))
+            .field("start", &self.start)
             .field("level", &self.level)
+            .field("count", &self.count)
             .field("sig", &"<sig>")
             .finish()
     }
@@ -380,8 +299,8 @@ where
 
 #[test]
 fn test_offset_iter() {
-    let iter = OffsetIter::<u8>::new(
-        !11u8, // 11110100
+    let iter = OffsetIter::new(
+        11u64, // ..00001011
         10, 8, true,
     );
     assert_eq!(
@@ -391,11 +310,31 @@ fn test_offset_iter() {
 }
 
 #[test]
+fn test_entry_indices() {
+    let entry = SignatureEntry {
+        nonrev: Block::from(u8::MAX as u64), // ..00011111111
+        start: 4,
+        count: 8,
+        level: 0,
+        sig: [0u8; 48],
+    };
+    assert_eq!(
+        entry.indices().collect::<Vec<_>>(),
+        vec![4, 5, 6, 7, 8, 9, 10, 11]
+    );
+}
+
+#[test]
 fn test_build_block() {
     let mut idx = 0;
-    let repr = Block::<64>::build(|| {
+    let repr = Block::build(64, || {
         idx += 1;
         Some(idx == 3 || idx == 5)
-    });
-    assert_eq!(repr, Some((1u64 << 2) + (1 << 4)));
+    })
+    .unwrap();
+    assert_eq!(repr, Block::from((1u64 << 2) + (1 << 4)));
+    assert_eq!(
+        repr.to_le_bytes(),
+        [(1u8 << 2) + (1 << 4), 0, 0, 0, 0, 0, 0, 0]
+    );
 }
