@@ -10,6 +10,7 @@ edition = "2018"
 [dependencies]
 bbs = "0.4"
 bbs-revocation = { path = "./bbs_revocation" }
+clap = "2.33"
 rand = "0.7"
 
 [profile.release]
