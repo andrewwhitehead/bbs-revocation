@@ -23,10 +23,11 @@ pub use self::util::compute_index_message;
 fn test_registry_cycle() {
     use std::io::Cursor;
 
+    let block_size = 64;
     let (dpk, sk) = DeterministicPublicKey::new(None);
     let mut buf = Vec::new();
     let mut c = Cursor::new(&mut buf);
-    let reg = RegistryBuilder::new("test:uri", 64, 5, &dpk, &sk).timestamp(1000);
+    let reg = RegistryBuilder::new("test:uri", block_size, 5, &dpk, &sk).timestamp(1000);
     reg.write(&mut c, [0].iter().copied()).unwrap();
     // 208 (header size) + 8 (entries length) + 8 (entry header) + 8 (bit array) + 48 (signature)
     assert_eq!(buf.len(), 280);
@@ -38,7 +39,7 @@ fn test_registry_cycle() {
     assert_eq!(header.registry_uri.as_ref(), "test:uri");
     assert_eq!(header.timestamp, 1000);
     assert_eq!(header.interval, 0);
-    assert_eq!(header.block_size, 64);
+    assert_eq!(header.block_size, block_size);
     assert_eq!(header.levels, 2);
     let entries = reader.entry_count_reset().unwrap();
     assert_eq!(entries, 1);
@@ -59,7 +60,7 @@ fn test_cred_zkp() {
     use std::io::Cursor;
     use std::iter::FromIterator;
 
-    let block_size = 8;
+    let block_size = 16;
     let slot_index = 1;
     let (dpk, sk) = DeterministicPublicKey::new(None);
 
@@ -125,6 +126,12 @@ fn test_cred_zkp() {
 
     let proof_1 = pok_issued.gen_proof(&chal_prover).unwrap();
     let proof_2 = pok_nrc.gen_proof(&chal_prover).unwrap();
+    println!(
+        "Proof sizes: {}, {}",
+        proof_1.to_bytes_compressed_form().len(),
+        // 256 + (block_size * 32) bytes
+        proof_2.to_bytes_compressed_form().len()
+    );
 
     // The verifier generates the challenge on its own
     let mut chal_bytes = Vec::new();
@@ -137,6 +144,11 @@ fn test_cred_zkp() {
         // slot_index is the first hidden message (index `HEADER_MESSAGES` in the credential)
         proof_1.get_resp_for_message(0).unwrap(),
         // hidden message index in the non-revocation credential
+        proof_2.get_resp_for_message(nrc_compare_index).unwrap()
+    );
+    // Sanity check second index fails
+    assert_ne!(
+        proof_1.get_resp_for_message(1).unwrap(),
         proof_2.get_resp_for_message(nrc_compare_index).unwrap()
     );
     assert!(proof_1
