@@ -1,7 +1,7 @@
 use std::{collections::HashSet, fs::File, io::Seek, str::FromStr, time::Instant};
 
 use bbs::issuer::Issuer;
-use bbs_revocation::{compute_index_message, RegistryBuilder, RegistryReader};
+use bbs_revocation::{RegistryBuilder, RegistryReader};
 use clap::{App, Arg};
 use rand::{distributions::Uniform, rngs::OsRng, Rng};
 
@@ -33,7 +33,7 @@ fn build_test_registry(
     f.sync_all().unwrap();
     let reg_size = f.stream_position().unwrap();
     let dur = timer.elapsed();
-    drop(f);
+    drop(f); // close file
     println!(
         "Wrote registry: {} indices, {} revoked in {:0.2}s",
         index_count,
@@ -69,20 +69,14 @@ fn build_test_registry(
 
         if revoked_count < index_count {
             for _ in 0..check_count {
-                let header_messages = reader.header().signature_messages();
                 let verkey = reader.public_key();
                 let mut check_idx = OsRng.sample(Uniform::from(0..index_count));
                 loop {
                     if !revoked.contains(&check_idx) {
-                        if let Some((ids, level, sig)) =
-                            reader.find_signature_reset(check_idx).unwrap()
-                        {
-                            let mut messages = Vec::with_capacity(68);
-                            messages.extend(&header_messages[..]);
-                            for index in ids {
-                                messages.push(compute_index_message(index, level));
-                            }
-                            let verify = sig.verify(messages.as_slice(), &verkey).unwrap();
+                        if let Some(cred) = reader.find_credential_reset(check_idx).unwrap() {
+                            let verify = cred.with_messages(|msgs| {
+                                cred.signature.verify(&msgs[..], &verkey).unwrap()
+                            });
                             if verify {
                                 println!(
                                     "Checked: signature verifies for non-revoked index ({})",
@@ -113,7 +107,7 @@ fn build_test_registry(
             let mut rev_iter = revoked.iter().copied();
             for _ in 0..check_count {
                 if let Some(check_idx) = rev_iter.next() {
-                    if let None = reader.find_signature_reset(check_idx).unwrap() {
+                    if let None = reader.find_credential_reset(check_idx).unwrap() {
                         println!(
                             "Checked: signature missing for revoked index ({})",
                             check_idx
@@ -128,7 +122,7 @@ fn build_test_registry(
 
         // verify every entry:
         // for check_idx in 0..index_count {
-        //     let sig = reader.find_signature_reset(check_idx).unwrap();
+        //     let sig = reader.find_credential_reset(check_idx).unwrap();
         //     if revoked.contains(&check_idx) && sig.is_some() {
         //         println!("Found invalid signature {}", check_idx);
         //         return;
@@ -204,7 +198,7 @@ fn main() {
             .value_of("count")
             .and_then(|s| u32::from_str(s).ok())
             .and_then(|c| if c > 0 { Some(c) } else { None })
-            .ok_or_else(|| "Count must be a non-zero positive integer")?;
+            .ok_or_else(|| "Count must be an integer larger than zero")?;
 
         let revoked_perc = args
             .value_of("percent")

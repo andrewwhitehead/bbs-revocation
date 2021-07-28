@@ -12,8 +12,7 @@ use pairing_plus::bls12_381::Fr;
 use rand::rngs::OsRng;
 
 use super::block::{Block, SignatureEntry};
-use super::header::RegistryHeader;
-use super::SIG_HEADER_MESSAGES;
+use super::header::{RegistryHeader, HEADER_MESSAGES};
 
 #[derive(Clone, Debug)]
 pub struct RegistryBuilder<'b> {
@@ -33,8 +32,8 @@ impl<'b> RegistryBuilder<'b> {
         assert!(block_size > 0 && block_size <= 64 && block_size % 8 == 0);
         Self {
             header: RegistryHeader {
-                type_: Cow::Borrowed("bbs-registry;v=1"),
-                uri: Cow::Borrowed(uri),
+                registry_type: Cow::Borrowed("bbs-registry;v=1"),
+                registry_uri: Cow::Borrowed(uri),
                 timestamp: SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap()
@@ -123,7 +122,7 @@ impl<W: Seek + Write> RegistryWriter<W> {
                 span = 0;
             }
             writer.write_all(&entry.nonrev.to_le_bytes()[..(entry.count as usize / 8)])?;
-            writer.write_all(&entry.sig[..])?;
+            writer.write_all(&entry.sig_a[..])?;
             span += 1;
             count += 1;
         }
@@ -146,7 +145,7 @@ pub struct SignatureProducer<'p> {
     level: u16,
     pk: PublicKey,
     sk: &'p SecretKey,
-    header_messages: [SignatureMessage; SIG_HEADER_MESSAGES],
+    header_messages: [SignatureMessage; HEADER_MESSAGES],
     e: Fr,
     s: Fr,
 }
@@ -270,8 +269,8 @@ fn test_sig_producer_level_1() {
     let e = Fr::random(&mut OsRng);
     let s = Fr::random(&mut OsRng);
     let header = RegistryHeader {
-        type_: Cow::Borrowed("reg-type"),
-        uri: Cow::Borrowed("reg-uri"),
+        registry_type: Cow::Borrowed("reg-type"),
+        registry_uri: Cow::Borrowed("reg-uri"),
         timestamp: 1,
         interval: 0,
         block_size: 8,
@@ -323,8 +322,8 @@ fn test_sig_producer_level_2() {
     let e = Fr::random(&mut OsRng);
     let s = Fr::random(&mut OsRng);
     let header = RegistryHeader {
-        type_: Cow::Borrowed("reg-type"),
-        uri: Cow::Borrowed("reg-uri"),
+        registry_type: Cow::Borrowed("reg-type"),
+        registry_uri: Cow::Borrowed("reg-uri"),
         timestamp: 1,
         interval: 0,
         block_size: 8,

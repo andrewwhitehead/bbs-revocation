@@ -1,12 +1,77 @@
 use std::io::{Error as IoError, Read, Seek, SeekFrom};
 
 use bbs::prelude::PublicKey;
-use bbs::{signature::Signature, G1_COMPRESSED_SIZE};
-use pairing_plus::bls12_381::Fr;
+use bbs::{signature::Signature, SignatureMessage, G1_COMPRESSED_SIZE};
 
-use super::block::{Block, SignatureEntry};
-use super::header::RegistryHeader;
-use super::util::*;
+use super::block::{Block, OffsetIter, SignatureEntry};
+use super::header::{header_messages, RegistryHeader};
+use super::util::read_fixed;
+
+pub struct NonRevCredential {
+    pub registry_type: String,
+    pub registry_uri: String,
+    pub timestamp: u64,
+    pub interval: u32,
+    pub block_size: u16,
+    pub level: u16,
+    pub nonrev: Block,
+    pub start: u32,
+    pub index: u32,
+    pub signature: Signature,
+}
+
+impl NonRevCredential {
+    pub(crate) fn new(
+        header: &RegistryHeader<'_>,
+        entry: &SignatureEntry,
+        slot_index: u32,
+    ) -> Self {
+        let index = if entry.level == 0 {
+            slot_index
+        } else {
+            slot_index / (entry.count as u32)
+        };
+        Self {
+            registry_type: header.registry_type.to_string(),
+            registry_uri: header.registry_uri.to_string(),
+            timestamp: header.timestamp,
+            interval: header.interval,
+            block_size: header.block_size,
+            level: entry.level,
+            nonrev: entry.nonrev,
+            start: entry.start,
+            index,
+            signature: entry.signature(header.e, header.s),
+        }
+    }
+
+    #[inline]
+    pub fn indices(&self) -> OffsetIter {
+        self.nonrev
+            .indices(self.start, self.block_size as usize, true)
+    }
+
+    #[inline]
+    pub fn unique_indices(&self) -> OffsetIter {
+        self.nonrev
+            .indices(self.start, self.block_size as usize, false)
+    }
+
+    pub fn messages(&self) -> Vec<SignatureMessage> {
+        self.with_messages(|m| m.iter().copied().collect())
+    }
+
+    pub fn with_messages<R>(&self, f: impl FnOnce(&[SignatureMessage]) -> R) -> R {
+        let head = header_messages(
+            &self.registry_type,
+            &self.registry_uri,
+            self.timestamp,
+            self.interval,
+        );
+        self.nonrev
+            .with_messages(head, self.start, self.block_size, self.level, f)
+    }
+}
 
 pub struct RegistryReader<'r, R> {
     header: RegistryHeader<'r>,
@@ -51,24 +116,21 @@ impl<'r, R: Read> RegistryReader<'r, R> {
         Ok(result)
     }
 
-    pub fn find_signature(
-        self,
-        slot_index: u32,
-    ) -> Result<Option<(Vec<u32>, u16, Signature)>, IoError> {
+    pub fn find_credential(self, slot_index: u32) -> Result<Option<NonRevCredential>, IoError> {
         SignatureIterator::new(self.reader, self.header.block_size, self.header.levels)
-            .find_signature(slot_index, self.header.e, self.header.s)
+            .find_credential(&self.header, slot_index)
     }
 
-    pub fn find_signature_reset(
+    pub fn find_credential_reset(
         &mut self,
         slot_index: u32,
-    ) -> Result<Option<(Vec<u32>, u16, Signature)>, IoError>
+    ) -> Result<Option<NonRevCredential>, IoError>
     where
         R: Seek,
     {
         let result =
             SignatureIterator::new(&mut self.reader, self.header.block_size, self.header.levels)
-                .find_signature(slot_index, self.header.e, self.header.s)?;
+                .find_credential(&self.header, slot_index)?;
         self.reader.reset()?;
         Ok(result)
     }
@@ -172,39 +234,38 @@ impl<R: DoneRead> SignatureIterator<R> {
         Ok(count)
     }
 
-    pub(crate) fn find_signature(
-        &mut self,
-        slot_index: u32,
-        e: Fr,
-        s: Fr,
-    ) -> Result<Option<(Vec<u32>, u16, Signature)>, IoError> {
-        if let Some(entry) = self.find_entry(slot_index)? {
-            let indices = entry.indices().collect();
-            let sig = entry.signature(e, s);
-            Ok(Some((indices, entry.level, sig)))
-        } else {
-            Ok(None)
-        }
-    }
-
     pub(crate) fn find_entry(
         &mut self,
         slot_index: u32,
     ) -> Result<Option<SignatureEntry>, IoError> {
         let block_index = slot_index / (self.block_size as u32);
-        for entry in self {
-            let entry = entry?;
-            if entry.level == 0 {
-                if let Some(true) = entry.contains_index(slot_index) {
-                    return Ok(Some(entry));
-                }
-            } else if entry.level == 1 {
-                if let Some(true) = entry.contains_index(block_index) {
-                    return Ok(Some(entry));
+        if let Some(mut reader) = self.reader.take() {
+            while !reader.is_done() {
+                let entry = self.read_next(&mut reader)?;
+                if entry.level == 0 {
+                    if let Some(true) = entry.contains_index(slot_index) {
+                        return Ok(Some(entry));
+                    }
+                } else if entry.level == 1 {
+                    if let Some(true) = entry.contains_index(block_index) {
+                        return Ok(Some(entry));
+                    }
                 }
             }
         }
         Ok(None)
+    }
+
+    pub(crate) fn find_credential(
+        &mut self,
+        header: &RegistryHeader<'_>,
+        slot_index: u32,
+    ) -> Result<Option<NonRevCredential>, IoError> {
+        if let Some(entry) = self.find_entry(slot_index)? {
+            Ok(Some(NonRevCredential::new(header, &entry, slot_index)))
+        } else {
+            Ok(None)
+        }
     }
 
     #[inline]
@@ -218,14 +279,14 @@ impl<R: DoneRead> SignatureIterator<R> {
             self.active_count = u16::from_be_bytes(count);
         }
         let nonrev = Block::read(&mut *reader, self.block_size)?;
-        let mut sig = [0u8; G1_COMPRESSED_SIZE];
-        reader.read_exact(sig.as_mut())?;
+        let mut sig_a = [0u8; G1_COMPRESSED_SIZE];
+        reader.read_exact(sig_a.as_mut())?;
         let entry = SignatureEntry {
             nonrev,
             start: self.active_offset,
             count: self.block_size,
             level: self.active_level,
-            sig,
+            sig_a,
         };
         self.active_count -= 1;
         self.active_offset += 1;

@@ -15,8 +15,8 @@ use pairing_plus::{
     CurveAffine, CurveProjective,
 };
 
+use super::header::HEADER_MESSAGES;
 use super::util::*;
-use super::SIG_HEADER_MESSAGES;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
@@ -89,7 +89,7 @@ impl Block {
 
     pub fn compute_b(
         &self,
-        head: [SignatureMessage; SIG_HEADER_MESSAGES],
+        head: [SignatureMessage; HEADER_MESSAGES],
         start: u32,
         count: u16,
         level: u16,
@@ -97,7 +97,7 @@ impl Block {
         s: Fr,
     ) -> G1 {
         assert!(count <= 64);
-        const FC: usize = 2 + SIG_HEADER_MESSAGES + 64;
+        const FC: usize = 2 + HEADER_MESSAGES + 64;
         // up to 2 + 66 messages
         let mut bases = heapless::Vec::<_, FC>::new();
         let mut scalars = heapless::Vec::<[u64; 4], FC>::new();
@@ -130,6 +130,25 @@ impl Block {
     #[inline]
     pub fn to_le_bytes(&self) -> [u8; Self::SIZE] {
         self.0.to_le_bytes()
+    }
+
+    #[inline]
+    pub fn with_messages<R>(
+        &self,
+        head: [SignatureMessage; HEADER_MESSAGES],
+        start: u32,
+        count: u16,
+        level: u16,
+        f: impl FnOnce(&[SignatureMessage]) -> R,
+    ) -> R {
+        const FC: usize = HEADER_MESSAGES + 64;
+        let mut msgs = heapless::Vec::<SignatureMessage, FC>::new();
+        msgs.extend(head.iter().copied());
+        msgs.extend(
+            OffsetIter::new(self.0, start, count as usize, true)
+                .map(|index| compute_index_message(index, level)),
+        );
+        f(&msgs[..])
     }
 }
 
@@ -216,29 +235,29 @@ pub struct SignatureEntry {
     pub start: u32,
     pub level: u16,
     pub count: u16,
-    pub sig: [u8; G1_COMPRESSED_SIZE],
+    pub sig_a: [u8; G1_COMPRESSED_SIZE],
 }
 
 impl SignatureEntry {
     pub(crate) fn create(
         nonrev: Block,
-        head: [SignatureMessage; SIG_HEADER_MESSAGES],
+        head: [SignatureMessage; HEADER_MESSAGES],
         start: u32,
         count: u16,
         level: u16,
         pk: &PublicKey,
         sk: &SecretKey,
-        e: Fr,
-        s: Fr,
+        sig_e: Fr,
+        sig_s: Fr,
     ) -> SignatureEntry {
-        let b = nonrev.compute_b(head, start, count, level, pk, s);
-        let sig = sign_b(sk, e, b);
+        let b = nonrev.compute_b(head, start, count, level, pk, sig_s);
+        let sig_a = sign_b(sk, sig_e, b);
         SignatureEntry {
             nonrev,
             start,
             count,
             level,
-            sig,
+            sig_a,
         }
     }
 
@@ -248,6 +267,16 @@ impl SignatureEntry {
         } else {
             None
         }
+    }
+
+    pub fn index_position(&self, mut index: u32) -> Option<usize> {
+        if self.level == 1 {
+            index /= self.count as u32;
+        }
+        self.nonrev
+            .indices(self.start, self.count as usize, false)
+            .enumerate()
+            .find_map(|(pos, i)| if i == index { Some(pos) } else { None })
     }
 
     #[inline]
@@ -260,28 +289,23 @@ impl SignatureEntry {
         self.nonrev.indices(self.start, self.count as usize, false)
     }
 
-    pub fn signature(&self, e: Fr, s: Fr) -> Signature {
+    pub(crate) fn signature(&self, sig_e: Fr, sig_s: Fr) -> Signature {
         let mut sig = [0u8; SIGNATURE_COMPRESSED_SIZE];
         let mut c = Cursor::new(&mut sig[..]);
-        c.write(&self.sig[..]).unwrap();
-        e.serialize(&mut c, true).unwrap();
-        s.serialize(&mut c, true).unwrap();
+        c.write(&self.sig_a[..]).unwrap();
+        sig_e.serialize(&mut c, true).unwrap();
+        sig_s.serialize(&mut c, true).unwrap();
         Signature::from(sig)
     }
 
+    #[cfg(test)]
     pub fn with_messages<R>(
         &self,
-        head: [SignatureMessage; SIG_HEADER_MESSAGES],
+        head: [SignatureMessage; HEADER_MESSAGES],
         f: impl FnOnce(&[SignatureMessage]) -> R,
     ) -> R {
-        const FC: usize = 2 + SIG_HEADER_MESSAGES + 64;
-        let mut msgs = heapless::Vec::<SignatureMessage, FC>::new();
-        msgs.extend(head.iter().copied());
-        msgs.extend(
-            self.indices()
-                .map(|index| compute_index_message(index, self.level)),
-        );
-        f(&msgs[..])
+        self.nonrev
+            .with_messages(head, self.start, self.count, self.level, f)
     }
 }
 
@@ -292,7 +316,7 @@ impl Debug for SignatureEntry {
             .field("start", &self.start)
             .field("level", &self.level)
             .field("count", &self.count)
-            .field("sig", &"<sig>")
+            .field("sig_a", &"<sig>")
             .finish()
     }
 }
@@ -316,7 +340,7 @@ fn test_entry_indices() {
         start: 4,
         count: 8,
         level: 0,
-        sig: [0u8; 48],
+        sig_a: [0u8; 48],
     };
     assert_eq!(
         entry.indices().collect::<Vec<_>>(),

@@ -15,12 +15,13 @@ use pairing_plus::{
 };
 
 use super::util::*;
-use super::SIG_HEADER_MESSAGES;
+
+pub const HEADER_MESSAGES: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegistryHeader<'h> {
-    pub type_: Cow<'h, str>,
-    pub uri: Cow<'h, str>,
+    pub registry_type: Cow<'h, str>,
+    pub registry_uri: Cow<'h, str>,
     pub timestamp: u64,
     pub interval: u32,
     pub block_size: u16,
@@ -59,8 +60,8 @@ impl RegistryHeader<'static> {
         let s = Fr::deserialize(&mut c, true)?;
         Ok((
             Self {
-                type_: Cow::Owned(typ),
-                uri: Cow::Owned(uri),
+                registry_type: Cow::Owned(typ),
+                registry_uri: Cow::Owned(uri),
                 timestamp,
                 interval,
                 block_size,
@@ -77,25 +78,24 @@ impl RegistryHeader<'static> {
 impl RegistryHeader<'_> {
     pub fn public_key(&self) -> PublicKey {
         self.dpk
-            .to_public_key(SIG_HEADER_MESSAGES + (self.block_size as usize))
+            .to_public_key(HEADER_MESSAGES + (self.block_size as usize))
             .unwrap()
     }
 
-    pub fn signature_messages(&self) -> [SignatureMessage; SIG_HEADER_MESSAGES] {
-        [
-            hash_to_fr(self.type_.as_bytes()).into(),
-            hash_to_fr(self.uri.as_bytes()).into(),
-            Fr::from_repr(FrRepr::from(self.timestamp)).unwrap().into(),
-            Fr::from_repr(FrRepr::from(self.interval as u64))
-                .unwrap()
-                .into(),
-        ]
+    pub fn signature_messages(&self) -> [SignatureMessage; HEADER_MESSAGES] {
+        header_messages(
+            &self.registry_type,
+            &self.registry_uri,
+            self.timestamp,
+            self.interval,
+        )
     }
 
     pub fn write(&self, writer: &mut impl Write) -> Result<(), IoError> {
-        write_str(writer, &self.type_)?;
-        write_str(writer, &self.uri)?;
-        let pad_len = (self.type_.as_bytes().len() + self.uri.as_bytes().len()) % 8;
+        write_str(writer, &self.registry_type)?;
+        write_str(writer, &self.registry_uri)?;
+        let pad_len =
+            (self.registry_type.as_bytes().len() + self.registry_uri.as_bytes().len()) % 8;
         let pad = [0u8; 8];
         if pad_len > 0 {
             writer.write_all(&pad[0..(8 - pad_len)])?;
@@ -117,6 +117,21 @@ impl RegistryHeader<'_> {
     }
 }
 
+#[inline]
+pub(crate) fn header_messages(
+    reg_type: &str,
+    reg_uri: &str,
+    timestamp: u64,
+    interval: u32,
+) -> [SignatureMessage; HEADER_MESSAGES] {
+    [
+        hash_to_fr(reg_type.as_bytes()).into(),
+        hash_to_fr(reg_uri.as_bytes()).into(),
+        Fr::from_repr(FrRepr::from(timestamp)).unwrap().into(),
+        Fr::from_repr(FrRepr::from(interval as u64)).unwrap().into(),
+    ]
+}
+
 #[test]
 fn test_header_serde() {
     use ff_zeroize::Field;
@@ -124,8 +139,8 @@ fn test_header_serde() {
 
     let (dpk, _sk) = DeterministicPublicKey::new(None);
     let header = RegistryHeader {
-        type_: Cow::Borrowed("registry/1"),
-        uri: Cow::Borrowed("test:uri"),
+        registry_type: Cow::Borrowed("registry/1"),
+        registry_uri: Cow::Borrowed("test:uri"),
         timestamp: 1000,
         interval: 1001,
         block_size: 64,
