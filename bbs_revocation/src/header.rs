@@ -82,7 +82,7 @@ impl RegistryHeader<'_> {
             .unwrap()
     }
 
-    pub fn signature_messages(&self) -> [SignatureMessage; HEADER_MESSAGES] {
+    pub fn messages(&self) -> [SignatureMessage; HEADER_MESSAGES] {
         header_messages(
             &self.registry_type,
             &self.registry_uri,

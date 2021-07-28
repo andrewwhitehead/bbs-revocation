@@ -74,9 +74,10 @@ fn build_test_registry(
                 loop {
                     if !revoked.contains(&check_idx) {
                         if let Some(cred) = reader.find_credential_reset(check_idx).unwrap() {
-                            let verify = cred.with_messages(|msgs| {
-                                cred.signature.verify(&msgs[..], &verkey).unwrap()
-                            });
+                            let verify = cred
+                                .signature
+                                .verify(&cred.messages()[..], &verkey)
+                                .unwrap();
                             if verify {
                                 println!(
                                     "Checked: signature verifies for non-revoked index ({})",

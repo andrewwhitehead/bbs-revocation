@@ -186,7 +186,7 @@ impl<'p> SignatureProducer<'p> {
             level: 1,
             pk,
             sk,
-            header_messages: header.signature_messages(),
+            header_messages: header.messages(),
             e: header.e,
             s: header.s,
         }
@@ -279,7 +279,7 @@ fn test_sig_producer_level_1() {
         e,
         s,
     };
-    let header_messages = header.signature_messages();
+    let header_messages = header.messages();
     let producer =
         SignatureProducer::from_revoked(&header, entry_count, revoked.iter().copied(), &sk);
     let entries = producer.collect::<Vec<_>>();
@@ -296,20 +296,20 @@ fn test_sig_producer_level_1() {
     );
     let sig0 = entries[0].signature(e, s);
     let pk = header.public_key();
-    let verified = entries[0]
-        .with_messages(header_messages, |msgs| sig0.verify(msgs, &pk))
+    let verified = sig0
+        .verify(&entries[0].messages(header_messages)[..], &pk)
         .unwrap();
     assert_eq!(verified, true);
 
     let sig1 = entries[1].signature(e, s);
-    let verified = entries[1]
-        .with_messages(header_messages, |msgs| sig1.verify(msgs, &pk))
+    let verified = sig1
+        .verify(&entries[1].messages(header_messages)[..], &pk)
         .unwrap();
     assert_eq!(verified, true);
 
     // check wrong signature
-    let verified = entries[1]
-        .with_messages(header_messages, |msgs| sig0.verify(msgs, &pk))
+    let verified = sig0
+        .verify(&entries[1].messages(header_messages)[..], &pk)
         .unwrap();
     assert_eq!(verified, false);
 }
@@ -332,7 +332,7 @@ fn test_sig_producer_level_2() {
         e,
         s,
     };
-    let header_messages = header.signature_messages();
+    let header_messages = header.messages();
     let producer =
         SignatureProducer::from_revoked(&header, entry_count, revoked.iter().copied(), &sk);
     let entries = producer.collect::<Vec<_>>();
@@ -354,20 +354,21 @@ fn test_sig_producer_level_2() {
     );
     let sig0 = entries[0].signature(e, s);
     let pk = header.public_key();
-    let verified = entries[0]
-        .with_messages(header_messages, |msgs| sig0.verify(msgs, &pk))
+    let verified = sig0
+        .verify(&entries[0].messages(header_messages)[..], &pk)
         .unwrap();
+
     assert_eq!(verified, true);
 
     let sig1 = entries[1].signature(e, s);
-    let verified = entries[1]
-        .with_messages(header_messages, |msgs| sig1.verify(msgs, &pk))
+    let verified = sig1
+        .verify(&entries[1].messages(header_messages)[..], &pk)
         .unwrap();
     assert_eq!(verified, true);
 
     // check wrong signature
-    let verified = entries[1]
-        .with_messages(header_messages, |msgs| sig0.verify(msgs, &pk))
+    let verified = sig0
+        .verify(&entries[1].messages(header_messages)[..], &pk)
         .unwrap();
     assert_eq!(verified, false);
 }

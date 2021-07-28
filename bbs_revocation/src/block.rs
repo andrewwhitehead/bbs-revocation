@@ -5,8 +5,11 @@ use std::{
 
 use bbs::{
     keys::{PublicKey, SecretKey},
+    messages::{HiddenMessage, ProofMessage},
+    pm_hidden_raw, pm_revealed_raw,
+    pok_sig::PoKOfSignature,
     signature::{Signature, SIGNATURE_COMPRESSED_SIZE},
-    SignatureMessage, G1_COMPRESSED_SIZE,
+    ProofNonce, SignatureMessage, G1_COMPRESSED_SIZE,
 };
 use ff_zeroize::PrimeField;
 use pairing_plus::{
@@ -17,6 +20,8 @@ use pairing_plus::{
 
 use super::header::HEADER_MESSAGES;
 use super::util::*;
+
+pub const MESSAGES_MAX: usize = HEADER_MESSAGES + 64;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
@@ -97,7 +102,7 @@ impl Block {
         s: Fr,
     ) -> G1 {
         assert!(count <= 64);
-        const FC: usize = 2 + HEADER_MESSAGES + 64;
+        const FC: usize = 2 + MESSAGES_MAX;
         // up to 2 + 66 messages
         let mut bases = heapless::Vec::<_, FC>::new();
         let mut scalars = heapless::Vec::<[u64; 4], FC>::new();
@@ -133,22 +138,54 @@ impl Block {
     }
 
     #[inline]
-    pub fn with_messages<R>(
+    pub fn index_messages(
+        &self,
+        start: u32,
+        count: u16,
+        level: u16,
+    ) -> impl IntoIterator<Item = SignatureMessage> {
+        OffsetIter::new(self.0, start, count as usize, true)
+            .map(move |index| compute_index_message(index, level))
+    }
+
+    pub fn create_pok_of_signature(
         &self,
         head: [SignatureMessage; HEADER_MESSAGES],
         start: u32,
         count: u16,
         level: u16,
-        f: impl FnOnce(&[SignatureMessage]) -> R,
-    ) -> R {
-        const FC: usize = HEADER_MESSAGES + 64;
-        let mut msgs = heapless::Vec::<SignatureMessage, FC>::new();
-        msgs.extend(head.iter().copied());
-        msgs.extend(
-            OffsetIter::new(self.0, start, count as usize, true)
-                .map(|index| compute_index_message(index, level)),
-        );
-        f(&msgs[..])
+        index: u32,
+        blinding: ProofNonce,
+        pk: &PublicKey,
+        signature: &Signature,
+    ) -> (PoKOfSignature, usize) {
+        let mut proof_messages = heapless::Vec::<ProofMessage, MESSAGES_MAX>::new();
+
+        // revealed header messages
+        for msg in head.iter().copied() {
+            proof_messages.push(pm_revealed_raw!(msg)).ok().unwrap();
+        }
+
+        // hidden index messages, with nonce fixed for the relevant index
+        let indices = OffsetIter::new(self.0, start, count as usize, true);
+        let mut found_pos = None;
+        for (pos, offs) in indices.enumerate() {
+            let msg = compute_index_message(offs, level);
+            if offs == index {
+                found_pos = Some(pos);
+                proof_messages
+                    .push(pm_hidden_raw!(msg, blinding))
+                    .ok()
+                    .unwrap();
+            } else {
+                proof_messages.push(pm_hidden_raw!(msg)).ok().unwrap();
+            }
+        }
+
+        (
+            PoKOfSignature::init(signature, pk, &proof_messages[..]).unwrap(),
+            found_pos.unwrap(),
+        )
     }
 }
 
@@ -299,13 +336,17 @@ impl SignatureEntry {
     }
 
     #[cfg(test)]
-    pub fn with_messages<R>(
+    pub fn messages(
         &self,
         head: [SignatureMessage; HEADER_MESSAGES],
-        f: impl FnOnce(&[SignatureMessage]) -> R,
-    ) -> R {
-        self.nonrev
-            .with_messages(head, self.start, self.count, self.level, f)
+    ) -> heapless::Vec<SignatureMessage, MESSAGES_MAX> {
+        let mut messages = heapless::Vec::<SignatureMessage, MESSAGES_MAX>::new();
+        messages.extend(head.iter().copied());
+        messages.extend(
+            self.nonrev
+                .index_messages(self.start, self.count, self.level),
+        );
+        messages
     }
 }
 

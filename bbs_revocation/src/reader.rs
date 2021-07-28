@@ -1,10 +1,12 @@
 use std::io::{Error as IoError, Read, Seek, SeekFrom};
 
-use bbs::prelude::PublicKey;
-use bbs::{signature::Signature, SignatureMessage, G1_COMPRESSED_SIZE};
+use bbs::prelude::{DeterministicPublicKey, PoKOfSignature};
+use bbs::{
+    keys::PublicKey, signature::Signature, ProofNonce, SignatureMessage, G1_COMPRESSED_SIZE,
+};
 
-use super::block::{Block, OffsetIter, SignatureEntry};
-use super::header::{header_messages, RegistryHeader};
+use super::block::{Block, SignatureEntry, MESSAGES_MAX};
+use super::header::{header_messages, RegistryHeader, HEADER_MESSAGES};
 use super::util::read_fixed;
 
 pub struct NonRevCredential {
@@ -13,6 +15,7 @@ pub struct NonRevCredential {
     pub timestamp: u64,
     pub interval: u32,
     pub block_size: u16,
+    pub dpk: DeterministicPublicKey,
     pub level: u16,
     pub nonrev: Block,
     pub start: u32,
@@ -37,6 +40,7 @@ impl NonRevCredential {
             timestamp: header.timestamp,
             interval: header.interval,
             block_size: header.block_size,
+            dpk: header.dpk,
             level: entry.level,
             nonrev: entry.nonrev,
             start: entry.start,
@@ -46,30 +50,66 @@ impl NonRevCredential {
     }
 
     #[inline]
-    pub fn indices(&self) -> OffsetIter {
+    pub fn indices(&self) -> impl IntoIterator<Item = u32> {
         self.nonrev
             .indices(self.start, self.block_size as usize, true)
     }
 
     #[inline]
-    pub fn unique_indices(&self) -> OffsetIter {
+    pub fn unique_indices(&self) -> impl IntoIterator<Item = u32> {
         self.nonrev
             .indices(self.start, self.block_size as usize, false)
     }
 
-    pub fn messages(&self) -> Vec<SignatureMessage> {
-        self.with_messages(|m| m.iter().copied().collect())
-    }
-
-    pub fn with_messages<R>(&self, f: impl FnOnce(&[SignatureMessage]) -> R) -> R {
-        let head = header_messages(
+    pub fn header_messages(&self) -> [SignatureMessage; HEADER_MESSAGES] {
+        header_messages(
             &self.registry_type,
             &self.registry_uri,
             self.timestamp,
             self.interval,
+        )
+    }
+
+    pub fn create_pok_of_signature(
+        &self,
+        pk: &PublicKey,
+        blinding: ProofNonce,
+    ) -> (PoKOfSignature, usize) {
+        self.nonrev.create_pok_of_signature(
+            self.header_messages(),
+            self.start,
+            self.block_size,
+            self.level,
+            self.index,
+            blinding,
+            pk,
+            &self.signature,
+        )
+    }
+
+    pub fn public_key(&self) -> PublicKey {
+        self.dpk
+            .to_public_key(HEADER_MESSAGES + (self.block_size as usize))
+            .unwrap()
+    }
+
+    pub fn messages(&self) -> heapless::Vec<SignatureMessage, MESSAGES_MAX> {
+        let mut messages = heapless::Vec::<SignatureMessage, MESSAGES_MAX>::new();
+        messages.extend(
+            header_messages(
+                &self.registry_type,
+                &self.registry_uri,
+                self.timestamp,
+                self.interval,
+            )
+            .iter()
+            .copied(),
         );
-        self.nonrev
-            .with_messages(head, self.start, self.block_size, self.level, f)
+        messages.extend(
+            self.nonrev
+                .index_messages(self.start, self.block_size, self.level),
+        );
+        messages
     }
 }
 
